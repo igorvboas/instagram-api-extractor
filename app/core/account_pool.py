@@ -138,15 +138,46 @@ class AccountPool:
     
     def get_available_account(self) -> Optional[InstagramAccount]:
         """
-        Obtém conta disponível do pool com algoritmo inteligente
+        Obtém conta disponível do pool com algoritmo inteligente e debug aprimorado
         
         Returns:
             InstagramAccount ou None se nenhuma disponível
         """
-        available_accounts = [acc for acc in self.accounts if acc.is_available()]
+        logger.info(f"Verificando contas disponíveis no pool de {len(self.accounts)} contas")
+        
+        # DEBUG: Verificar cada conta individualmente
+        available_accounts = []
+        for i, acc in enumerate(self.accounts):
+            logger.info(f"Conta {i+1}: {acc.username} - Status: {acc.status}")
+            
+            # CORREÇÃO: Implementar is_available() manualmente se método falhar
+            try:
+                is_available = acc.is_available()
+                logger.info(f"  - is_available() retornou: {is_available}")
+            except Exception as e:
+                logger.warning(f"  - is_available() falhou: {e}")
+                # Fallback: verificar manualmente
+                is_available = self._is_account_available_fallback(acc)
+                logger.info(f"  - fallback is_available: {is_available}")
+            
+            if is_available:
+                available_accounts.append(acc)
+                logger.info(f"  - ✅ Conta {acc.username} adicionada à lista de disponíveis")
+            else:
+                logger.info(f"  - ❌ Conta {acc.username} não está disponível")
+        
+        logger.info(f"Total de contas disponíveis encontradas: {len(available_accounts)}")
         
         if not available_accounts:
             logger.warning("Nenhuma conta disponível no pool")
+            
+            # DEBUG: Tentar forçar uma conta ACTIVE mesmo que is_available() seja False
+            logger.info("Tentando fallback - procurando contas ACTIVE...")
+            for acc in self.accounts:
+                if acc.status == AccountStatus.ACTIVE:
+                    logger.warning(f"FALLBACK: Usando conta {acc.username} que está ACTIVE mas is_available()=False")
+                    return acc
+            
             return None
         
         # Algoritmo de seleção: peso baseado em health score e tempo de última utilização
@@ -170,6 +201,38 @@ class AccountPool:
         
         logger.info(f"Conta selecionada: {best_account.username} (health: {best_account.health_score:.1f})")
         return best_account
+    
+    def _is_account_available_fallback(self, account: InstagramAccount) -> bool:
+        """
+        Implementação fallback para verificar se conta está disponível
+        
+        Args:
+            account: Conta para verificar
+            
+        Returns:
+            bool: True se disponível
+        """
+        try:
+            # Verificar status básico
+            if account.status != AccountStatus.ACTIVE:
+                return False
+            
+            # Verificar limite diário
+            if account.operations_today >= self.settings.max_daily_operations_per_account:
+                return False
+            
+            # Verificar cooldown
+            if account.last_used:
+                cooldown_time = timedelta(minutes=self.settings.account_cooldown_minutes)
+                if datetime.now() - account.last_used < cooldown_time:
+                    return False
+            
+            # Se passou em todos os testes, está disponível
+            return True
+            
+        except Exception as e:
+            logger.error(f"Erro no fallback is_available para {account.username}: {e}")
+            return False
     
     def get_client(self, account: InstagramAccount) -> Optional[Client]:
         """
@@ -289,7 +352,15 @@ class AccountPool:
         for status in AccountStatus:
             status_counts[status.value] = len([acc for acc in self.accounts if acc.status == status])
         
-        available_count = len([acc for acc in self.accounts if acc.is_available()])
+        # CORREÇÃO: Usar fallback para contar contas disponíveis
+        available_count = 0
+        for acc in self.accounts:
+            try:
+                if acc.is_available():
+                    available_count += 1
+            except:
+                if self._is_account_available_fallback(acc):
+                    available_count += 1
         
         avg_health = sum(acc.health_score for acc in self.accounts) / len(self.accounts) if self.accounts else 0
         
@@ -310,6 +381,8 @@ class AccountPool:
                     data = json.load(f)
                     self.accounts = [InstagramAccount(**acc_data) for acc_data in data]
                 logger.info(f"Pool carregado: {len(self.accounts)} contas")
+            else:
+                logger.info("Arquivo de pool não existe, iniciando com pool vazio")
         except Exception as e:
             logger.error(f"Erro ao carregar pool: {e}")
             self.accounts = []
@@ -317,6 +390,9 @@ class AccountPool:
     def _save_pool(self):
         """Salva pool de contas no arquivo"""
         try:
+            # Criar diretório se não existir
+            os.makedirs(os.path.dirname(self._pool_file), exist_ok=True)
+            
             data = [acc.dict() for acc in self.accounts]
             with open(self._pool_file, 'w') as f:
                 json.dump(data, f, indent=2, default=str)
