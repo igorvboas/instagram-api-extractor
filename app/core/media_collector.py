@@ -31,6 +31,16 @@ from app.models import InstagramAccount, MediaFile, CollectionResult, MediaType,
 from app.core.account_pool import AccountPool
 from app.utils.logging_config import get_app_logger
 
+# topo do arquivo:
+import requests
+
+# ADD no topo do arquivo (imports)
+from pydantic import ValidationError as PydValidationError
+try:
+    from pydantic_core._pydantic_core import ValidationError as CoreValidationError  # pydantic v2
+except Exception:
+    CoreValidationError = Exception
+
 logger = get_app_logger(__name__)
 
 
@@ -168,25 +178,19 @@ class MediaCollector:
            
             if include_feed:
                 logger.info(f"Coletando posts das últimas 24h de @{username} (max: {max_feed_posts})")
-                logger.success(f"Encontrados {len(feed_posts)} posts das últimas 24h")
                 try:
                     feed_posts = await self._collect_feed_posts_safe(client, target_user.pk, max_feed_posts)
+                    logger.success(f"Encontrados {len(feed_posts)} posts das últimas 24h")
                     if feed_posts:
-                        logger.success(f"Encontrados {len(feed_posts)} posts das últimas 24h")
-                        
-                        # Download dos posts
                         feed_files = await self._download_feed_posts_safe(client, feed_posts, username)
                         result.feed_posts = feed_files
-                        
-                        logger.info(f"[DEBUG] feed_files retornado: {len(feed_files)} arquivos (type={type(feed_files)})")
-
                         logger.success(f"Downloaded {len(feed_files)} feed files das últimas 24h")
                     else:
                         logger.info(f"Nenhum post das últimas 24h encontrado para @{username}")
-                        
                 except Exception as e:
                     logger.warning(f"Erro ao coletar feed: {str(e)}")
-                    # Não falha a operação inteira por erro no feed
+
+
             
             # Marcar conta como usada com sucesso
             self.pool.mark_account_used(account, success=True)
@@ -314,75 +318,141 @@ class MediaCollector:
             logger.warning(f"Erro ao coletar stories: {e}")
             return []
     
+
+
     async def _collect_feed_posts_safe(self, client: Client, user_id: int, max_posts: int) -> List[Media]:
         """
-        Coleta posts do feed de um usuário das últimas 24 horas de forma segura
-        
-        Args:
-            client: Cliente Instagram
-            user_id: ID do usuário
-            max_posts: Máximo de posts para coletar
-            
-        Returns:
-            Lista de posts do feed das últimas 24h
+        Coleta posts (inclui Reels) das últimas 24h com fallbacks tolerantes:
+        GQL -> V1 -> CLIPS -> RAW (private_request sem pydantic)
         """
-        def _get_feed_sync():
+        def _normalize_dt(dt):
+            if not dt:
+                return None
             try:
-                search_limit = min(max_posts * 5, 50)
+                if getattr(dt, "tzinfo", None) is None:
+                    return dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc)
+            except Exception:
+                return None
+
+        def _safe_list(medias):
+            safe = []
+            for m in medias or []:
                 try:
-                    all_medias = client.user_medias(user_id, amount=search_limit)
-                except Exception as e:
-                    logger.warning(f"Falha ao coletar mídias: {e}")
-                    # Continue mesmo se der erro, pode ser só warning/parsing
-                    all_medias = []
-                return all_medias or [], None
+                    _ = getattr(m, "pk", None)
+                    _ = getattr(m, "taken_at", None)
+                    safe.append(m)
+                except (PydValidationError, CoreValidationError, AttributeError, TypeError):
+                    continue
+            return safe
+
+        def _get_feed_gql():
+            medias = client.user_medias_gql(user_id, amount=min(max_posts * 5, 50))
+            return _safe_list(medias)
+
+        def _get_feed_v1():
+            medias = client.user_medias_v1(user_id, amount=min(max_posts * 5, 50))
+            return _safe_list(medias)
+
+        def _get_clips():
+            medias = client.user_clips(user_id, amount=min(max_posts * 5, 50))
+            return _safe_list(medias)
+
+        # Fallback RAW: não usa pydantic; montamos stubs simples
+        def _get_feed_raw():
+            try:
+                # endpoint privado v1
+                resp = client.private_request(
+                    f"feed/user/{user_id}/",
+                    params={"count": min(max_posts * 5, 50)}
+                )
+                items = resp.get("items", []) or []
             except Exception as e:
-                return [], str(e)
-        
+                logger.warning(f"RAW feed falhou: {e}")
+                return []
+
+            class _Stub:
+                __slots__ = ("pk", "media_type", "taken_at", "resources", "is_pinned")
+                def __init__(self, pk, media_type, taken_at, resources=None, is_pinned=False):
+                    self.pk = pk
+                    self.media_type = media_type
+                    self.taken_at = taken_at
+                    self.resources = resources or []
+                    self.is_pinned = is_pinned
+
+            stubs = []
+            for it in items:
+                try:
+                    pk = it.get("pk") or it.get("id")
+                    if not pk:
+                        continue
+                    media_type = it.get("media_type")  # 1 img, 2 video, 8 carousel
+                    ts = it.get("taken_at") or it.get("device_timestamp")
+                    # ts geralmente é epoch seconds
+                    taken_at = datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float)) else None
+
+                    # carousel recursos (se quisermos baixar cada node depois)
+                    resources = []
+                    if media_type == 8:
+                        for r in it.get("carousel_media", []) or []:
+                            r_pk = r.get("pk") or r.get("id")
+                            r_type = r.get("media_type")
+                            resources.append(type("R", (), {"pk": r_pk, "media_type": r_type}))
+
+                    is_pinned = bool(it.get("is_pinned", False))
+                    stubs.append(_Stub(str(pk), int(media_type) if media_type else None, taken_at, resources, is_pinned))
+                except Exception:
+                    continue
+            return stubs
+
         try:
             await self._random_delay()
-            all_medias, error = await asyncio.get_event_loop().run_in_executor(
-                self.executor, _get_feed_sync
-            )
-            
-            if error:
-                if "login_required" in error.lower():
-                    raise LoginRequired(error)
-                else:
-                    logger.warning(f"Erro ao coletar feed posts: {error}")
-                    return []
-            
+
+            all_medias: List[Media] = []
+            try:
+                all_medias = _get_feed_gql()
+            except Exception as e1:
+                logger.warning(f"GQL falhou, tentando V1: {e1}")
+                try:
+                    all_medias = _get_feed_v1()
+                except Exception as e2:
+                    logger.warning(f"V1 falhou, tentando CLIPS: {e2}")
+                    try:
+                        all_medias = _get_clips()
+                    except Exception as e3:
+                        logger.warning(f"CLIPS também falhou, usando RAW: {e3}")
+                        all_medias = _get_feed_raw()
+
             if not all_medias:
                 return []
-            
-            # Filtrar posts das últimas 24 horas
-            # Old calculation => twenty_four_hours_ago = datetime.now() - timedelta(hours=24)
-            # Agora, usando UTC (offset-aware)
+
             twenty_four_hours_ago = datetime.now(timezone.utc) - timedelta(hours=24)
-            
-            recent_posts = []
-            print(f"[DEBUG] user_medias retornou: {len(all_medias)} posts")
-            print(f"[DEBUG] twenty_four_hours_ago = {twenty_four_hours_ago}")
+            recent = []
             for media in all_medias:
-                print(f"[DEBUG] media.taken_at = {media.taken_at}")
-                # Verificar se o post foi feito nas últimas 24h
-                if media.taken_at and media.taken_at >= twenty_four_hours_ago:
-                    print("[DEBUG] --> Vai entrar no filtro!")
-                    recent_posts.append(media)
-                    # Se já temos posts suficientes, parar
-                    if len(recent_posts) >= max_posts:
+                if getattr(media, "is_pinned", False):
+                    continue
+                taken_at = _normalize_dt(getattr(media, "taken_at", None))
+                if not taken_at:
+                    continue
+                if taken_at >= twenty_four_hours_ago:
+                    recent.append(media)
+                    if len(recent) >= max_posts:
                         break
                 else:
-                    # Como os posts vêm em ordem cronológica reversa,
-                    # se encontramos um post mais antigo que 24h, podemos parar
                     break
-            
-            logger.info(f"Posts filtrados: {len(recent_posts)} dos últimos {len(all_medias)} posts são das últimas 24h")
-            return recent_posts
-            
+
+            logger.info(f"Posts filtrados: {len(recent)} dos últimos {len(all_medias)} são das últimas 24h")
+            return recent
+
+        except (PydValidationError, CoreValidationError) as e:
+            logger.warning(f"Validação de mídia quebrou, retornando vazio: {e}")
+            return []
         except Exception as e:
             logger.warning(f"Erro ao coletar feed posts: {e}")
             return []
+
+
+
     
     async def _download_stories_safe(self, client: Client, stories: List[Story], username: str) -> List[MediaFile]:
         """
@@ -562,213 +632,137 @@ class MediaCollector:
             logger.error(f"Erro ao baixar story {story.pk}: {e}")
             return None
     
-    async def _download_single_post_safe(self, client: Client, post: Media, username: str) -> Optional[MediaFile]:
+
+
+    def _best_media_urls(self, post):
         """
-        Baixa arquivo individual de post de forma segura
-        
-        Args:
-            client: Cliente Instagram
-            post: Media object
-            username: Nome do usuário
-            
-        Returns:
-            MediaFile com dados binários ou None se erro
+        Retorna uma lista de (media_type, url) para o post (inclui carrossel).
+        media_type: 1=imagem, 2=vídeo
         """
-        def _download_post_sync():
-            try:
-                temp_file = None
-                media_type = None
-                
-                if post.media_type == 1:  # Foto
-                    temp_file = client.photo_download(post.pk, folder=str(self.temp_dir))
-                    media_type = MediaType.IMAGE
-                elif post.media_type == 2:  # Vídeo/IGTV/Reels
-                    temp_file = client.video_download(post.pk, folder=str(self.temp_dir))
-                    media_type = MediaType.VIDEO
-                else:
-                    return None, f"Tipo de post não suportado: {post.media_type}", None
-                
-                if not temp_file or not os.path.exists(temp_file):
-                    return None, f"Arquivo não baixado: {post.pk}", None
-                
-                return temp_file, None, media_type
-                
-            except Exception as e:
-                return None, str(e), None
-        
+        urls = []
         try:
-            temp_file, error, media_type = await asyncio.get_event_loop().run_in_executor(
-                self.executor, _download_post_sync
-            )
-            
-            if error:
-                if "login_required" in error.lower():
-                    raise LoginRequired(error)
+            if getattr(post, "media_type", None) == 8 and getattr(post, "resources", None):
+                # carrossel
+                for r in post.resources:
+                    if getattr(r, "media_type", None) == 2:
+                        url = getattr(r, "video_url", None) or getattr(r, "thumbnail_url", None)
+                        if url: urls.append((2, url))
+                    else:
+                        url = getattr(r, "thumbnail_url", None)
+                        if url: urls.append((1, url))
+            else:
+                # post simples
+                if getattr(post, "media_type", None) == 2:
+                    url = getattr(post, "video_url", None) or getattr(post, "thumbnail_url", None)
+                    if url: urls.append((2, url))
                 else:
-                    logger.warning(f"Erro no download do post: {error}")
-                    return None
-            
-            if not temp_file:
-                return None
-            
-            # Ler dados binários
-            try:
-                with open(temp_file, 'rb') as f:
-                    binary_data = f.read()
-                
-                # Remover arquivo temporário
-                os.remove(temp_file)
-                
-                # Criar MediaFile
-                filename = f"post_{post.pk}_{username}.{self._get_file_extension(media_type)}"
-                
-                metadata = {
-                    "post_id": post.pk,
-                    "taken_at": post.taken_at.isoformat() if post.taken_at else None,
-                    "media_type": post.media_type,
-                    "username": username,
-                    "is_story": False,
-                    "like_count": getattr(post, 'like_count', 0),
-                    "comment_count": getattr(post, 'comment_count', 0)
-                }
-                
-                # Adicionar informação sobre idade do post
-                if post.taken_at:
-                    # Use datetime.now(timezone.utc) para garantir timezone compatível
-                    hours_old = (datetime.now(timezone.utc) - post.taken_at).total_seconds() / 3600
-                    metadata["hours_old"] = round(hours_old, 1)
-                    metadata["is_recent"] = hours_old <= 24
-                
-                # Adicionar metadados específicos
-                if hasattr(post, 'video_duration') and post.video_duration:
-                    metadata["duration_seconds"] = post.video_duration
-                    
-                if hasattr(post, 'caption_text') and post.caption_text:
-                    metadata["caption"] = post.caption_text[:500]  # Limitar caption
-                
-                media_file = MediaFile(
-                    id=post.pk,
-                    type=media_type,
-                    binary_data=binary_data,
-                    filename=filename,
-                    size_bytes=len(binary_data),
-                    metadata=metadata
-                )
-                
-                return media_file
-                
-            except Exception as e:
-                logger.error(f"Erro ao processar arquivo baixado {temp_file}: {e}")
-                # Tentar remover arquivo mesmo em caso de erro
-                try:
-                    if os.path.exists(temp_file):
-                        os.remove(temp_file)
-                except:
-                    pass
-                return None
-            
+                    url = getattr(post, "thumbnail_url", None)
+                    if url: urls.append((1, url))
+        except Exception:
+            pass
+        return urls
+
+    def _fetch_url_bytes(self, url: str) -> Optional[bytes]:
+        try:
+            # sem cookies e sem headers especiais: CDN pública
+            resp = requests.get(url, timeout=30)
+            if resp.status_code == 200:
+                return resp.content
         except Exception as e:
-            logger.error(f"Erro ao baixar post {post.pk}: {e}")
+            logger.warning(f"Falha ao baixar URL direta: {e}")
+        return None
+
+
+
+
+
+    async def _download_single_post_safe(self, client: Client, post: Media, username: str) -> Optional[MediaFile]:
+        pairs = self._best_media_urls(post)
+        if not pairs:
+            logger.warning(f"Nenhuma URL pública para post {getattr(post, 'pk', '???')}")
             return None
+
+        # pega a primeira url “melhor”
+        media_type_num, url = pairs[0]
+        binary_data = await asyncio.get_event_loop().run_in_executor(self.executor, self._fetch_url_bytes, url)
+        if not binary_data:
+            return None
+
+        mtype = MediaType.VIDEO if media_type_num == 2 else MediaType.IMAGE
+        filename = f"post_{post.pk}_{username}.{self._get_file_extension(mtype)}"
+
+        metadata={
+            # "post_id": getattr(post, "pk", None),
+            "post_id": str(getattr(post, "pk", "")),
+            "taken_at": post.taken_at.isoformat() if getattr(post, "taken_at", None) else None,
+            "media_type": getattr(post, "media_type", None),
+            "username": username,
+            "is_story": False,
+            "like_count": getattr(post, "like_count", 0),
+            "comment_count": getattr(post, "comment_count", 0),
+            **({"hours_old": round((datetime.now(timezone.utc) - post.taken_at).total_seconds()/3600, 1),
+                "is_recent": (datetime.now(timezone.utc) - post.taken_at).total_seconds() <= 24*3600}
+               if getattr(post, "taken_at", None) else {})
+        }
+        if getattr(post, "taken_at", None):
+            hours_old = (datetime.now(timezone.utc) - post.taken_at).total_seconds() / 3600
+            metadata["hours_old"] = round(hours_old, 1)
+            metadata["is_recent"] = hours_old <= 24
+        if getattr(post, "video_duration", None):
+            metadata["duration_seconds"] = post.video_duration
+        if getattr(post, "caption_text", None):
+            metadata["caption"] = post.caption_text[:500]
+
+        return MediaFile(
+            # id=getattr(post, "pk", None),
+            id=str(getattr(post, "pk", "")),
+            type=mtype,
+            binary_data=binary_data,
+            filename=filename,
+            size_bytes=len(binary_data),
+            metadata=metadata
+        )
+
     
     async def _download_carousel_post_safe(self, client: Client, post: Media, username: str) -> List[MediaFile]:
-        """
-        Baixa arquivos de post carrossel (múltiplas imagens/vídeos) de forma segura
-        
-        Args:
-            client: Cliente Instagram
-            post: Media object (carrossel)
-            username: Nome do usuário
-            
-        Returns:
-            Lista de MediaFile
-        """
         media_files = []
-        
-        try:
-            # Obter recursos do carrossel
-            resources = getattr(post, 'resources', [])
-            if not resources:
-                logger.warning(f"Carrossel {post.pk} sem recursos")
-                return media_files
-            
-            for i, resource in enumerate(resources):
-                try:
-                    def _download_carousel_item_sync():
-                        try:
-                            temp_file = None
-                            media_type = None
-                            
-                            if resource.media_type == 1:  # Foto
-                                temp_file = client.photo_download(resource.pk, folder=str(self.temp_dir))
-                                media_type = MediaType.IMAGE
-                            elif resource.media_type == 2:  # Vídeo
-                                temp_file = client.video_download(resource.pk, folder=str(self.temp_dir))
-                                media_type = MediaType.VIDEO
-                            else:
-                                return None, f"Tipo não suportado: {resource.media_type}", None
-                            
-                            if not temp_file or not os.path.exists(temp_file):
-                                return None, f"Arquivo não baixado: {resource.pk}", None
-                            
-                            return temp_file, None, media_type
-                            
-                        except Exception as e:
-                            return None, str(e), None
-                    
-                    temp_file, error, media_type = await asyncio.get_event_loop().run_in_executor(
-                        self.executor, _download_carousel_item_sync
-                    )
-                    
-                    if error or not temp_file:
-                        logger.warning(f"Erro ao baixar item {i+1} do carrossel: {error}")
-                        continue
-                    
-                    # Ler dados binários
-                    with open(temp_file, 'rb') as f:
-                        binary_data = f.read()
-                    
-                    # Remover arquivo temporário
-                    os.remove(temp_file)
-                    
-                    # Criar MediaFile
-                    filename = f"carousel_{post.pk}_{i+1}_{username}.{self._get_file_extension(media_type)}"
-                    
-                    metadata = {
-                        "post_id": post.pk,
-                        "carousel_index": i + 1,
-                        "carousel_total": len(resources),
-                        "resource_id": resource.pk,
-                        "taken_at": post.taken_at.isoformat() if post.taken_at else None,
-                        "media_type": resource.media_type,
-                        "username": username,
-                        "is_story": False,
-                        "is_carousel": True
-                    }
-                    
-                    media_file = MediaFile(
-                        id=f"{post.pk}_{i+1}",
-                        type=media_type,
-                        binary_data=binary_data,
-                        filename=filename,
-                        size_bytes=len(binary_data),
-                        metadata=metadata
-                    )
-                    
-                    media_files.append(media_file)
-                    
-                    # Delay entre itens do carrossel
-                    if i < len(resources) - 1:
-                        await self._random_delay(0.5, 1.0)
-                        
-                except Exception as e:
-                    logger.warning(f"Erro ao baixar item {i+1} do carrossel {post.pk}: {e}")
-                    continue
-            
-        except Exception as e:
-            logger.error(f"Erro ao processar carrossel {post.pk}: {e}")
-        
+        pairs = self._best_media_urls(post)
+        if not pairs:
+            return media_files
+
+        for i, (media_type_num, url) in enumerate(pairs, 1):
+            binary_data = await asyncio.get_event_loop().run_in_executor(self.executor, self._fetch_url_bytes, url)
+            if not binary_data:
+                continue
+
+            mtype = MediaType.VIDEO if media_type_num == 2 else MediaType.IMAGE
+            filename = f"carousel_{post.pk}_{i}_{username}.{self._get_file_extension(mtype)}"
+            metadata = {
+                # "post_id": getattr(post, "pk", None),
+                "post_id": str(getattr(post, "pk", "")),
+                "carousel_index": i,
+                "carousel_total": len(pairs),
+                "taken_at": post.taken_at.isoformat() if getattr(post, "taken_at", None) else None,
+                "media_type": media_type_num,
+                "username": username,
+                "is_story": False,
+                "is_carousel": True
+            }
+            media_files.append(MediaFile(
+                # id=f"{getattr(post, 'pk', 'unknown')}_{i}",
+                id=f"{str(getattr(post, 'pk', 'unknown'))}_{i}",
+                type=mtype,
+                binary_data=binary_data,
+                filename=filename,
+                size_bytes=len(binary_data),
+                metadata=metadata
+            ))
+
+            if i < len(pairs):
+                await self._random_delay(0.5, 1.0)
+
         return media_files
+
     
     def _get_file_extension(self, media_type: MediaType) -> str:
         """
