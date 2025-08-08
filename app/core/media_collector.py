@@ -10,12 +10,13 @@ import time
 import random
 import tempfile
 import hashlib
-from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any, Tuple
 from pathlib import Path
 import mimetypes
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+
 
 from instagrapi import Client
 from instagrapi.types import Story, Media, User
@@ -72,6 +73,9 @@ class MediaCollector:
         Returns:
             CollectionResult com mídias coletadas
         """
+        feed_posts = []
+        feed_files = []
+
         start_time = time.time()
         logger.info(f"Iniciando coleta para @{username}")
         
@@ -161,8 +165,10 @@ class MediaCollector:
             await self._random_delay()
             
             # Coletar feed posts se solicitado
+           
             if include_feed:
                 logger.info(f"Coletando posts das últimas 24h de @{username} (max: {max_feed_posts})")
+                logger.success(f"Encontrados {len(feed_posts)} posts das últimas 24h")
                 try:
                     feed_posts = await self._collect_feed_posts_safe(client, target_user.pk, max_feed_posts)
                     if feed_posts:
@@ -172,6 +178,8 @@ class MediaCollector:
                         feed_files = await self._download_feed_posts_safe(client, feed_posts, username)
                         result.feed_posts = feed_files
                         
+                        logger.info(f"[DEBUG] feed_files retornado: {len(feed_files)} arquivos (type={type(feed_files)})")
+
                         logger.success(f"Downloaded {len(feed_files)} feed files das últimas 24h")
                     else:
                         logger.info(f"Nenhum post das últimas 24h encontrado para @{username}")
@@ -320,9 +328,13 @@ class MediaCollector:
         """
         def _get_feed_sync():
             try:
-                # Buscar mais posts para filtrar por data (até 50)
                 search_limit = min(max_posts * 5, 50)
-                all_medias = client.user_medias(user_id, amount=search_limit)
+                try:
+                    all_medias = client.user_medias(user_id, amount=search_limit)
+                except Exception as e:
+                    logger.warning(f"Falha ao coletar mídias: {e}")
+                    # Continue mesmo se der erro, pode ser só warning/parsing
+                    all_medias = []
                 return all_medias or [], None
             except Exception as e:
                 return [], str(e)
@@ -344,12 +356,18 @@ class MediaCollector:
                 return []
             
             # Filtrar posts das últimas 24 horas
-            twenty_four_hours_ago = datetime.now() - timedelta(hours=24)
+            # Old calculation => twenty_four_hours_ago = datetime.now() - timedelta(hours=24)
+            # Agora, usando UTC (offset-aware)
+            twenty_four_hours_ago = datetime.now(timezone.utc) - timedelta(hours=24)
             
             recent_posts = []
+            print(f"[DEBUG] user_medias retornou: {len(all_medias)} posts")
+            print(f"[DEBUG] twenty_four_hours_ago = {twenty_four_hours_ago}")
             for media in all_medias:
+                print(f"[DEBUG] media.taken_at = {media.taken_at}")
                 # Verificar se o post foi feito nas últimas 24h
                 if media.taken_at and media.taken_at >= twenty_four_hours_ago:
+                    print("[DEBUG] --> Vai entrar no filtro!")
                     recent_posts.append(media)
                     # Se já temos posts suficientes, parar
                     if len(recent_posts) >= max_posts:
@@ -616,7 +634,8 @@ class MediaCollector:
                 
                 # Adicionar informação sobre idade do post
                 if post.taken_at:
-                    hours_old = (datetime.now() - post.taken_at).total_seconds() / 3600
+                    # Use datetime.now(timezone.utc) para garantir timezone compatível
+                    hours_old = (datetime.now(timezone.utc) - post.taken_at).total_seconds() / 3600
                     metadata["hours_old"] = round(hours_old, 1)
                     metadata["is_recent"] = hours_old <= 24
                 

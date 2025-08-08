@@ -45,7 +45,7 @@ def setup_logging(settings: Settings):
     file_handler.setLevel(logging.INFO)  # Arquivo: INFO e acima
     
     # Handler para console SIMPLIFICADO (só coisas importantes)
-    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler = logging.StreamHandler(sys.__stdout__)
     console_formatter = logging.Formatter(
         '%(levelname)s - %(message)s'  # Formato mais limpo para console
     )
@@ -53,12 +53,12 @@ def setup_logging(settings: Settings):
     console_handler.setLevel(logging.WARNING)  # Console: só WARNING e ERROR
     
     # No Windows, configurar encoding do console
-    if sys.platform == "win32":
-        try:
-            import codecs
-            sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
-        except:
-            pass
+    #if sys.platform == "win32":
+    #    try:
+    #        import codecs
+    #        sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
+    #    except:
+    #        pass
     
     # Configurar logger raiz
     root_logger = logging.getLogger()

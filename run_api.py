@@ -9,25 +9,29 @@ import os
 # Adicionar diretório raiz ao path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+if hasattr(sys, '__stdout__'):
+    sys.stdout = sys.__stdout__
+    sys.stderr = sys.__stderr__
+
 from app.main import app
-import uvicorn
 from app.config import Settings
+import uvicorn
 
 if __name__ == "__main__":
     settings = Settings()
-    
+
     print("🚀 Instagram Collection API")
-    print("="*50)
+    print("=" * 50)
     print(f"🌐 Host: {settings.api_host}")
     print(f"🔌 Port: {settings.api_port}")
     print(f"📁 Sessions: {settings.session_dir}")
     print(f"📊 Max accounts: {settings.max_accounts}")
-    print("="*50)
-    
+    print("=" * 50)
+
     uvicorn.run(
-        "app.main:app",
+        app,
         host=settings.api_host,
         port=settings.api_port,
-        reload=True,
+        reload=False,  # ✅ Corrige o erro de logging
         log_level="info"
     )
