@@ -6,6 +6,7 @@ Script para executar a Instagram Collection API
 import sys
 import os
 
+
 # Adicionar diretório raiz ao path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -13,7 +14,7 @@ if hasattr(sys, '__stdout__'):
     sys.stdout = sys.__stdout__
     sys.stderr = sys.__stderr__
 
-from app.main import app
+from app.api.main import app
 from app.config import Settings
 import uvicorn
 

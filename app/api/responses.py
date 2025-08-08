@@ -9,7 +9,31 @@ from pydantic import BaseModel, Field
 from datetime import datetime
 import base64
 
+class AccountIn(BaseModel):
+    username: str = Field(..., description="Username do Instagram", examples=["usuario.teste"])
+    password: str = Field(..., description="Senha da conta", min_length=1)
+    proxy: Optional[str] = Field(None, description="Proxy opcional (ex: http://user:pass@host:port)")
 
+class AccountBatchIn(BaseModel):
+    accounts: List[AccountIn] = Field(..., min_items=1, description="Lista de contas")
+
+class AccountOut(BaseModel):
+    username: str
+    status: str
+    health_score: float
+    operations_today: int
+    last_used: Optional[datetime] = None
+    available: bool
+
+class AccountsListResponse(BaseModel):
+    total: int
+    accounts: List[AccountOut]
+
+class OperationResult(BaseModel):
+    success: bool
+    message: str
+    details: Optional[Dict] = None
+    
 class MediaFileResponse(BaseModel):
     """Response model para arquivo de mídia"""
     id: str = Field(description="ID único do arquivo")

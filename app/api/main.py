@@ -193,7 +193,14 @@ async def api_status():
 @app.middleware("http")
 async def log_requests(request, call_next):
     """Log de todas as requests"""
-    start_time = datetime.now()
-    
-    # Log da request
-    logger.info(f"📨 {request.method} {request.url.path}")
+    import time as _time
+    start = _time.perf_counter()
+    response = None
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        # Mesmo se der erro, logamos o tempo decorrido
+        elapsed_ms = (_time.perf_counter() - start) * 1000
+        status = getattr(response, "status_code", "ERR")
+        logger.info(f"📨 {request.method} {request.url.path} -> {status} ({elapsed_ms:.1f} ms)")

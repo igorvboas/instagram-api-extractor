@@ -12,11 +12,15 @@ from fastapi.responses import JSONResponse
 
 from app.api.responses import (
     CollectionResponse, HealthResponse, PoolStatusResponse, 
-    ErrorResponse, APIInfoResponse, convert_collection_result_to_response
+    ErrorResponse, APIInfoResponse, AccountIn, AccountBatchIn, AccountOut, AccountsListResponse, OperationResult,convert_collection_result_to_response
 )
 from app.core.collection_service import CollectionService
 from app.config import Settings
 from app.utils.logging_config import get_app_logger
+
+from fastapi.encoders import jsonable_encoder
+
+from app.models import InstagramAccount
 
 # Logger
 logger = get_app_logger(__name__)
@@ -59,6 +63,132 @@ def init_collection_service(settings: Settings):
     logger.success("CollectionService inicializado para API")
 
 
+
+# ===================== Accounts Management =====================
+
+@router.get("/accounts", response_model=AccountsListResponse, summary="[Accounts] Listar contas")
+async def list_accounts():
+    """Lista todas as contas do pool com status resumido"""
+    service = get_collection_service()
+    pool = service.account_pool
+
+    items: list[AccountOut] = []
+    for acc in pool.accounts:
+        try:
+            # usar fallback de disponibilidade (o método pode lançar)
+            try:
+                available = bool(acc.is_available())
+            except Exception:
+                available = pool._is_account_available_fallback(acc)
+            items.append(AccountOut(
+                username=acc.username,
+                status=str(acc.status.value if hasattr(acc.status, "value") else acc.status),
+                health_score=float(acc.health_score),
+                operations_today=int(acc.operations_today),
+                last_used=acc.last_used,
+                available=available
+            ))
+        except Exception:
+            continue
+
+    return AccountsListResponse(total=len(items), accounts=items)
+
+
+@router.post("/accounts", response_model=OperationResult, summary="[Accounts] Adicionar conta")
+async def add_account(body: AccountIn):
+    """
+    Adiciona **uma** conta ao pool.  
+    **Atenção:** a senha **não** é logada nem retornada.
+    """
+    service = get_collection_service()
+    pool = service.account_pool
+
+    ok = pool.add_account(body.username.strip(), body.password, body.proxy)
+    if ok:
+        return OperationResult(success=True, message=f"Conta {body.username} adicionada.")
+    else:
+        return OperationResult(success=False, message=f"Falha ao adicionar {body.username}.")
+
+
+@router.post("/accounts/batch", response_model=OperationResult, summary="[Accounts] Adicionar múltiplas contas")
+async def add_accounts_batch(body: AccountBatchIn):
+    """Adiciona várias contas de uma vez."""
+    service = get_collection_service()
+    pool = service.account_pool
+
+    added, failed = [], []
+    for acc in body.accounts:
+        ok = pool.add_account(acc.username.strip(), acc.password, acc.proxy)
+        (added if ok else failed).append(acc.username)
+
+    return OperationResult(
+        success=len(failed) == 0,
+        message=f"Adicionadas: {len(added)} | Falharam: {len(failed)}",
+        details={"added": added, "failed": failed}
+    )
+
+
+@router.delete("/accounts/{username}", response_model=OperationResult, summary="[Accounts] Remover conta")
+async def remove_account(username: str = Path(..., description="Username para remover", example="usuario.teste")):
+    service = get_collection_service()
+    pool = service.account_pool
+
+    ok = pool.remove_account(username.strip())
+    if ok:
+        return OperationResult(success=True, message=f"Conta {username} removida.")
+    return OperationResult(success=False, message=f"Conta {username} não encontrada.")
+
+
+@router.post("/accounts/health-check", response_model=OperationResult, summary="[Accounts] Health check")
+async def accounts_health_check():
+    """Executa health check no pool (reseta operações diárias, tira de cooldown quando possível, tenta recuperar contas)."""
+    service = get_collection_service()
+    pool = service.account_pool
+
+    pool.health_check()
+    status = pool.get_pool_status()
+    return OperationResult(
+        success=True,
+        message="Health check concluído.",
+        details=status
+    )
+
+
+@router.post("/accounts/test/{username}", response_model=OperationResult, summary="[Accounts] Testar conta específica")
+async def test_account(username: str = Path(..., description="Username a testar", example="usuario.teste")):
+    """
+    Faz login na conta e tenta obter o `timeline_feed` para validar sessão/proxy.
+    """
+    service = get_collection_service()
+    pool = service.account_pool
+
+    # localizar
+    account = next((a for a in pool.accounts if a.username == username), None)
+    if not account:
+        return OperationResult(success=False, message=f"Conta {username} não encontrada.")
+
+    client = pool.get_client(account)
+    if not client:
+        return OperationResult(success=False, message=f"Não foi possível obter cliente para {username}.")
+
+    try:
+        client.get_timeline_feed()
+        # sucesso: atualiza saúde e retorna
+        account.update_health_score(True)
+        return OperationResult(
+            success=True,
+            message=f"Conta {username} OK.",
+            details={
+                "health_score": account.health_score,
+                "status": str(account.status.value if hasattr(account.status, "value") else account.status),
+                "operations_today": account.operations_today
+            }
+        )
+    except Exception as e:
+        account.update_health_score(False)
+        return OperationResult(success=False, message=f"Erro no teste: {e.__class__.__name__}: {e}")
+    
+    
 @router.get("/", response_model=APIInfoResponse, summary="Informações da API")
 async def get_api_info():
     """
@@ -305,11 +435,11 @@ async def http_exception_handler(request, exc: HTTPException):
     """Handler customizado para HTTPException"""
     return JSONResponse(
         status_code=exc.status_code,
-        content=ErrorResponse(
+        content=jsonable_encoder(ErrorResponse(
             error=exc.detail,
             timestamp=datetime.now(),
             username=request.path_params.get('username')
-        ).dict()
+        ))
     )
 
 
@@ -319,9 +449,9 @@ async def general_exception_handler(request, exc: Exception):
     
     return JSONResponse(
         status_code=500,
-        content=ErrorResponse(
+        content=jsonable_encoder(ErrorResponse(
             error="Erro interno do servidor",
             detail=str(exc),
             timestamp=datetime.now()
-        ).dict()
+        ))
     )
