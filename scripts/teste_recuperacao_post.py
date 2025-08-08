@@ -1,8 +1,8 @@
 from instagrapi import Client
 
-USERNAME = "igor2.semcodar@gmail.com"
-PASSWORD = "rufuS014."
-TARGET_USERNAME = "cadeomeuvoo"  # Usuário de teste
+USERNAME = ""
+PASSWORD = ""
+TARGET_USERNAME = ""  # Usuário de teste
 
 cl = Client()
 cl.login(USERNAME, PASSWORD)
